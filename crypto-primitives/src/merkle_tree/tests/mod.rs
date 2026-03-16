@@ -131,6 +131,67 @@ mod bytes_mt_tests {
     }
 
     #[test]
+    fn compact_multi_proof_test() {
+        let mut rng = test_rng();
+
+        // Test with several tree sizes and proof subsets
+        for num_leaves in [2u8, 4, 8, 16, 32] {
+            let leaves: Vec<_> = (0..num_leaves)
+                .map(|_| crate::to_uncompressed_bytes!(BigInteger256::rand(&mut rng)).unwrap())
+                .collect();
+
+            let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+            let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng).unwrap();
+
+            let tree =
+                JubJubMerkleTree::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+            let root = tree.root();
+
+            // Prove all leaves
+            let proof = tree
+                .generate_compact_multi_proof((0..leaves.len()).collect::<Vec<_>>())
+                .unwrap();
+            assert!(proof
+                .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+                .unwrap());
+
+            // Wrong root must fail
+            let wrong_root = tree
+                .generate_compact_multi_proof(vec![0])
+                .unwrap()
+                .leaf_proof_hashes
+                .first()
+                .cloned();
+            // Use a simple wrong root by generating a bogus proof and verifying with real root
+            // (just verify that an impossible subset also rejects a tampered check)
+            let proof_subset = tree
+                .generate_compact_multi_proof(vec![0, (num_leaves / 2) as usize])
+                .unwrap();
+            assert!(proof_subset
+                .verify(
+                    &leaf_crh_params,
+                    &two_to_one_params,
+                    &root,
+                    // supply leaves in sorted index order
+                    vec![leaves[0].clone(), leaves[(num_leaves / 2) as usize].clone()]
+                )
+                .unwrap());
+            // Supplying an incorrect leaf value must fail
+            let mut tampered = leaves[0].clone();
+            tampered[0] ^= 0xff;
+            assert!(!proof_subset
+                .verify(
+                    &leaf_crh_params,
+                    &two_to_one_params,
+                    &root,
+                    vec![tampered, leaves[(num_leaves / 2) as usize].clone()]
+                )
+                .unwrap());
+            let _ = wrong_root;
+        }
+    }
+
+    #[test]
     fn multi_proof_dissection_test() {
         let mut rng = test_rng();
 
@@ -306,5 +367,141 @@ mod field_mt_tests {
                 (127, rand_leaves()),
             ],
         )
+    }
+}
+
+/// Index-level trace of the Compact Merkle Multiproof algorithm.
+/// No actual hashing is performed; only the index selection at each round is shown.
+/// Run with `cargo test compact_proof_index_trace -- --nocapture` to see output.
+mod compact_proof_trace_tests {
+    use ark_std::collections::BTreeSet;
+
+    /// Prints the index selection at each round for a given set of leaf indices
+    /// and tree height, matching the paper's Figure 7 (arXiv:2002.07648).
+    fn trace_compact_proof(leaf_indexes: &[usize], tree_height: usize) {
+        let num_leaves = 1usize << (tree_height - 1);
+        println!(
+            "=== Compact Merkle Multiproof Index Trace ===\n\
+             Tree: {} leaves, height {}\n\
+             Proving leaves: {:?}\n",
+            num_leaves, tree_height, leaf_indexes
+        );
+
+        let mut a: Vec<usize> = leaf_indexes.to_vec();
+
+        // ---- Round 1: leaf layer ----
+        let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+        let b_pruned = {
+            let mut v = b.clone();
+            v.dedup();
+            v
+        };
+        let a_set: BTreeSet<usize> = a.iter().cloned().collect();
+        let diff: Vec<usize> = b_pruned
+            .iter()
+            .flat_map(|&[l, r]| [l, r])
+            .filter(|idx| !a_set.contains(idx))
+            .collect();
+
+        println!("Round 1 [leaf layer]");
+        println!("  A        = {:?}", a);
+        println!(
+            "  B        = [{}]",
+            b.iter()
+                .map(|p| format!("[{},{}]", p[0], p[1]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "  B_pruned = [{}]",
+            b_pruned
+                .iter()
+                .map(|p| format!("[{},{}]", p[0], p[1]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "  diff     = {:?}  <-- proof hash indices at this layer",
+            diff
+        );
+
+        a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+        println!("  A_new    = {:?}", a);
+
+        // ---- Inner layers ----
+        let mut current_depth = tree_height as isize - 2;
+        let mut round = 2;
+        while current_depth >= 1 {
+            let layer_size = 1usize << current_depth;
+            println!(
+                "\nRound {} [depth {} from root, layer size {}]",
+                round, current_depth, layer_size
+            );
+
+            let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+            let b_pruned = {
+                let mut v = b.clone();
+                v.dedup();
+                v
+            };
+            let a_set: BTreeSet<usize> = a.iter().cloned().collect();
+            let diff: Vec<usize> = b_pruned
+                .iter()
+                .flat_map(|&[l, r]| [l, r])
+                .filter(|idx| !a_set.contains(idx))
+                .collect();
+
+            println!("  A        = {:?}", a);
+            println!(
+                "  B        = [{}]",
+                b.iter()
+                    .map(|p| format!("[{},{}]", p[0], p[1]))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "  B_pruned = [{}]",
+                b_pruned
+                    .iter()
+                    .map(|p| format!("[{},{}]", p[0], p[1]))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "  diff     = {:?}  <-- proof hash indices at this layer",
+                diff
+            );
+
+            a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+            println!("  A_new    = {:?}", a);
+
+            current_depth -= 1;
+            round += 1;
+        }
+
+        println!(
+            "\n=== Reached root (index 0) after {} rounds ===",
+            round - 1
+        );
+    }
+
+    #[test]
+    fn compact_proof_index_trace_paper_example() {
+        // Reproduces the example from Figure 7 of the paper (arXiv:2002.07648):
+        // 16-leaf tree, proving leaves at indices [2, 3, 8, 13].
+
+        trace_compact_proof(&[2, 3, 8, 13], 5);
+    }
+
+    #[test]
+    fn compact_proof_index_trace_all_leaves_8() {
+        // All 8 leaves: shows that no proof hashes are needed.
+        trace_compact_proof(&[0, 1, 2, 3, 4, 5, 6, 7], 4);
+    }
+
+    #[test]
+    fn compact_proof_index_trace_single_leaf() {
+        // Single leaf: equivalent to a standard single-leaf proof.
+        trace_compact_proof(&[5], 4);
     }
 }

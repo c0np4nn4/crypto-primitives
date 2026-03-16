@@ -350,6 +350,137 @@ impl<P: Config> MultiPath<P> {
     }
 }
 
+/// Compact Merkle multiproof as described in:
+/// "Compact Merkle Multiproofs" by Lum Ramabaja and Arber Avdullahu (arXiv:2002.07648)
+///
+/// Unlike [`MultiPath`], this stores only k leaf indices plus the minimal set of
+/// proof hashes. The order of computation is fully determined by the leaf indices,
+/// so no non-leaf index data or path prefix encoding is required.
+///
+/// Proof structure:
+/// - `leaf_proof_hashes`: leaf-layer siblings that are not themselves being proved.
+/// - `inner_proof_hashes`: inner-node siblings, ordered bottom-up layer by layer,
+///   ascending index within each layer.
+#[derive(Derivative, CanonicalSerialize, CanonicalDeserialize)]
+#[derivative(
+    Clone(bound = "P: Config"),
+    Debug(bound = "P: Config"),
+    Default(bound = "P: Config")
+)]
+pub struct CompactMultiPath<P: Config> {
+    /// Sorted leaf indices of the elements being proved.
+    pub leaf_indexes: Vec<usize>,
+    /// Leaf-level proof hashes (siblings of proven leaves that are not themselves proven),
+    /// in ascending index order.
+    pub leaf_proof_hashes: Vec<P::LeafDigest>,
+    /// Inner-node proof hashes, ordered bottom-up layer by layer,
+    /// ascending index within each layer.
+    pub inner_proof_hashes: Vec<P::InnerDigest>,
+    /// Height of the original Merkle tree, needed to determine the number of inner layers
+    /// during verification.
+    pub height: usize,
+}
+
+impl<P: Config> CompactMultiPath<P> {
+    /// Verify that the leaves at `self.leaf_indexes` are present in the Merkle tree with the
+    /// given root. Leaves must be supplied in the same (sorted ascending) order as
+    /// `self.leaf_indexes`.
+    pub fn verify<L: Borrow<P::Leaf>>(
+        &self,
+        leaf_hash_params: &LeafParam<P>,
+        two_to_one_params: &TwoToOneParam<P>,
+        root_hash: &P::InnerDigest,
+        leaves: impl IntoIterator<Item = L>,
+    ) -> Result<bool, crate::Error> {
+        // Hash the provided leaves. leaf_indexes is sorted, so e_leaf is in the same order.
+        let e_leaf: Vec<P::LeafDigest> = self
+            .leaf_indexes
+            .iter()
+            .zip(leaves.into_iter())
+            .map(|(_, leaf)| P::LeafHash::evaluate(leaf_hash_params, leaf.borrow()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut a: Vec<usize> = self.leaf_indexes.clone();
+        let mut m_leaf_iter = self.leaf_proof_hashes.iter();
+        let mut m_inner_iter = self.inner_proof_hashes.iter();
+
+        // ---- Leaf layer ----
+        let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+        let b_pruned = {
+            let mut v = b.clone();
+            v.dedup();
+            v
+        };
+
+        let mut e: Vec<P::InnerDigest> = Vec::with_capacity(b_pruned.len());
+        {
+            let mut a_ptr = 0usize;
+            for &[l, r] in &b_pruned {
+                let (left_leaf, right_leaf) = compact_collect_pair(&a, &e_leaf, l, r, &mut a_ptr);
+                let left_inner = P::LeafInnerDigestConverter::convert(match left_leaf {
+                    Some(h) => h,
+                    None => match m_leaf_iter.next() {
+                        Some(h) => h.clone(),
+                        None => return Ok(false),
+                    },
+                })?;
+                let right_inner = P::LeafInnerDigestConverter::convert(match right_leaf {
+                    Some(h) => h,
+                    None => match m_leaf_iter.next() {
+                        Some(h) => h.clone(),
+                        None => return Ok(false),
+                    },
+                })?;
+                e.push(P::TwoToOneHash::evaluate(
+                    two_to_one_params,
+                    left_inner,
+                    right_inner,
+                )?);
+            }
+        }
+        a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+
+        // ---- Inner layers ----
+        // Iterate from depth (height-2) down to depth 1; (height-2) iterations total.
+        let mut current_depth = self.height as isize - 2;
+        while current_depth >= 1 {
+            let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+            let b_pruned = {
+                let mut v = b.clone();
+                v.dedup();
+                v
+            };
+
+            let mut new_e: Vec<P::InnerDigest> = Vec::with_capacity(b_pruned.len());
+            let mut a_ptr = 0usize;
+            for &[l, r] in &b_pruned {
+                let (left_node, right_node) = compact_collect_pair(&a, &e, l, r, &mut a_ptr);
+                let left = match left_node {
+                    Some(h) => h,
+                    None => match m_inner_iter.next() {
+                        Some(h) => h.clone(),
+                        None => return Ok(false),
+                    },
+                };
+                let right = match right_node {
+                    Some(h) => h,
+                    None => match m_inner_iter.next() {
+                        Some(h) => h.clone(),
+                        None => return Ok(false),
+                    },
+                };
+                new_e.push(P::TwoToOneHash::compress(two_to_one_params, &left, &right)?);
+            }
+            a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+            e = new_e;
+            current_depth -= 1;
+        }
+
+        // e must contain exactly one element: the reconstructed root.
+        Ok(e.len() == 1 && &e[0] == root_hash)
+    }
+}
+
 /// `index` is the first `path.len()` bits of
 /// the position of tree.
 ///
@@ -624,6 +755,76 @@ impl<P: Config> MerkleTree<P> {
         })
     }
 
+    /// Returns a [`CompactMultiPath`] using the Compact Merkle Multiproof algorithm.
+    /// Reference: "Compact Merkle Multiproofs", Ramabaja & Avdullahu (arXiv:2002.07648)
+    pub fn generate_compact_multi_proof(
+        &self,
+        indexes: impl IntoIterator<Item = usize>,
+    ) -> Result<CompactMultiPath<P>, crate::Error> {
+        let indexes: BTreeSet<usize> = indexes.into_iter().collect();
+        let leaf_indexes: Vec<usize> = indexes.iter().cloned().collect();
+
+        let mut leaf_proof_hashes: Vec<P::LeafDigest> = Vec::new();
+        let mut inner_proof_hashes: Vec<P::InnerDigest> = Vec::new();
+
+        let mut a: Vec<usize> = leaf_indexes.clone();
+
+        // ---- Leaf layer ----
+        let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+        let b_pruned = {
+            let mut v = b.clone();
+            v.dedup();
+            v
+        };
+
+        {
+            let a_set: BTreeSet<usize> = a.iter().cloned().collect();
+            for &[l, r] in &b_pruned {
+                if !a_set.contains(&l) {
+                    leaf_proof_hashes.push(self.leaf_nodes[l].clone());
+                }
+                if !a_set.contains(&r) {
+                    leaf_proof_hashes.push(self.leaf_nodes[r].clone());
+                }
+            }
+        }
+        a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+
+        // ---- Inner layers ----
+        // current_depth counts from root (0 = root).
+        // The bottom inner layer is at depth (height - 2).
+        // We process depths (height-2) down to 1.
+        let mut current_depth = self.height as isize - 2;
+        while current_depth >= 1 {
+            let b: Vec<[usize; 2]> = a.iter().map(|&i| [i & !1, (i & !1) + 1]).collect();
+            let b_pruned = {
+                let mut v = b.clone();
+                v.dedup();
+                v
+            };
+            let a_set: BTreeSet<usize> = a.iter().cloned().collect();
+            // In non_leaf_nodes (level-order), depth d starts at index 2^d - 1.
+            let level_start = (1usize << current_depth) - 1;
+            for &[l, r] in &b_pruned {
+                if !a_set.contains(&l) {
+                    inner_proof_hashes.push(self.non_leaf_nodes[level_start + l].clone());
+                }
+                if !a_set.contains(&r) {
+                    inner_proof_hashes.push(self.non_leaf_nodes[level_start + r].clone());
+                }
+            }
+            a = b_pruned.iter().map(|&[l, _]| l / 2).collect();
+            current_depth -= 1;
+        }
+
+        Ok(CompactMultiPath {
+            leaf_indexes,
+            leaf_proof_hashes,
+            inner_proof_hashes,
+            height: self.height,
+        })
+    }
+
     /// Given the index and new leaf, return the hash of leaf and an updated path in order from root to bottom non-leaf level.
     /// This does not mutate the underlying tree.
     fn updated_path<T: Borrow<P::Leaf>>(
@@ -814,4 +1015,30 @@ where
     } else {
         vec![prev_path[0..prefix_len].to_vec(), suffix.clone()].concat()
     }
+}
+
+/// For a sibling pair `[l, r]` in the compact multiproof algorithm, collects the elements
+/// from `e` whose corresponding index in `a` equals `l` or `r`, returning
+/// `(left_hash, right_hash)`. Advances `a_ptr` past all matched entries.
+///
+/// Since `a` is sorted and pairs are processed in ascending order, this runs in O(1)
+/// amortised time (each element of `a` is visited exactly once across all calls per layer).
+fn compact_collect_pair<T: Clone>(
+    a: &[usize],
+    e: &[T],
+    l: usize,
+    r: usize,
+    a_ptr: &mut usize,
+) -> (Option<T>, Option<T>) {
+    let mut left: Option<T> = None;
+    let mut right: Option<T> = None;
+    while *a_ptr < a.len() && (a[*a_ptr] == l || a[*a_ptr] == r) {
+        if a[*a_ptr] == l {
+            left = Some(e[*a_ptr].clone());
+        } else {
+            right = Some(e[*a_ptr].clone());
+        }
+        *a_ptr += 1;
+    }
+    (left, right)
 }

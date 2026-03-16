@@ -190,6 +190,230 @@ mod bytes_mt_benches {
         );
     }
 
+    pub fn merkle_tree_generate_compact_multi_proof(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+        c.bench_function(
+            "Merkle Tree Generate Compact Multi Proof (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    tree.generate_compact_multi_proof((0..leaves.len()).collect::<Vec<_>>())
+                        .unwrap();
+                })
+            },
+        );
+    }
+
+    pub fn merkle_tree_verify_compact_multi_proof(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+
+        let root = tree.root();
+
+        let compact_proof = tree
+            .generate_compact_multi_proof((0..leaves.len()).collect::<Vec<_>>())
+            .unwrap();
+
+        c.bench_function(
+            "Merkle Tree Verify Compact Multi Proof (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    compact_proof
+                        .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+                })
+            },
+        );
+    }
+
+    /// Benchmark with a sparse subset: only 128 out of NUM_LEAVES leaves are proved.
+    /// This scenario highlights the proof-size advantage of compact multiproofs,
+    /// since many sibling pairs can be merged and fewer hashes need to be stored.
+    pub fn merkle_tree_generate_multi_proof_sparse(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+
+        // Evenly spaced sparse subset of 128 indices
+        let stride = NUM_LEAVES as usize / 128;
+        let sparse_indexes: Vec<usize> = (0..128).map(|i| i * stride).collect();
+
+        c.bench_function(
+            "Merkle Tree Generate Multi Proof Sparse 128 (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    tree.generate_multi_proof(sparse_indexes.clone()).unwrap();
+                })
+            },
+        );
+    }
+
+    pub fn merkle_tree_generate_compact_multi_proof_sparse(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+
+        let stride = NUM_LEAVES as usize / 128;
+        let sparse_indexes: Vec<usize> = (0..128).map(|i| i * stride).collect();
+
+        c.bench_function(
+            "Merkle Tree Generate Compact Multi Proof Sparse 128 (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    tree.generate_compact_multi_proof(sparse_indexes.clone())
+                        .unwrap();
+                })
+            },
+        );
+    }
+
+    pub fn merkle_tree_verify_multi_proof_sparse(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+        let root = tree.root();
+
+        let stride = NUM_LEAVES as usize / 128;
+        let sparse_indexes: Vec<usize> = (0..128).map(|i| i * stride).collect();
+        let sparse_leaves: Vec<_> = sparse_indexes.iter().map(|&i| leaves[i].clone()).collect();
+
+        let proof = tree.generate_multi_proof(sparse_indexes).unwrap();
+
+        c.bench_function(
+            "Merkle Tree Verify Multi Proof Sparse 128 (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    proof.verify(
+                        &leaf_crh_params,
+                        &two_to_one_params,
+                        &root,
+                        sparse_leaves.clone(),
+                    )
+                })
+            },
+        );
+    }
+
+    pub fn merkle_tree_verify_compact_multi_proof_sparse(c: &mut Criterion) {
+        let mut rng = test_rng();
+        let leaves: Vec<_> = (0..NUM_LEAVES)
+            .map(|_| {
+                let rnd = BigInteger256::rand(&mut rng);
+                to_uncompressed_bytes!(rnd).unwrap()
+            })
+            .collect();
+        let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
+        let two_to_one_params = <CompressH as TwoToOneCRHScheme>::setup(&mut rng)
+            .unwrap()
+            .clone();
+
+        let tree = Sha256MerkleTree::new(
+            &leaf_crh_params.clone(),
+            &two_to_one_params.clone(),
+            &leaves,
+        )
+        .unwrap();
+        let root = tree.root();
+
+        let stride = NUM_LEAVES as usize / 128;
+        let sparse_indexes: Vec<usize> = (0..128).map(|i| i * stride).collect();
+        let sparse_leaves: Vec<_> = sparse_indexes.iter().map(|&i| leaves[i].clone()).collect();
+
+        let proof = tree
+            .generate_compact_multi_proof(sparse_indexes)
+            .unwrap();
+
+        c.bench_function(
+            "Merkle Tree Verify Compact Multi Proof Sparse 128 (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    proof.verify(
+                        &leaf_crh_params,
+                        &two_to_one_params,
+                        &root,
+                        sparse_leaves.clone(),
+                    )
+                })
+            },
+        );
+    }
+
     criterion_group! {
         name = mt_create;
         config = Criterion::default().sample_size(100);
@@ -199,13 +423,23 @@ mod bytes_mt_benches {
     criterion_group! {
         name = mt_proof;
         config = Criterion::default().sample_size(100);
-        targets = merkle_tree_generate_proof, merkle_tree_generate_multi_proof
+        targets =
+            merkle_tree_generate_proof,
+            merkle_tree_generate_multi_proof,
+            merkle_tree_generate_compact_multi_proof,
+            merkle_tree_generate_multi_proof_sparse,
+            merkle_tree_generate_compact_multi_proof_sparse
     }
 
     criterion_group! {
         name = mt_verify;
         config = Criterion::default().sample_size(10);
-        targets = merkle_tree_verify_proof, merkle_tree_verify_multi_proof
+        targets =
+            merkle_tree_verify_proof,
+            merkle_tree_verify_multi_proof,
+            merkle_tree_verify_compact_multi_proof,
+            merkle_tree_verify_multi_proof_sparse,
+            merkle_tree_verify_compact_multi_proof_sparse
     }
 }
 
